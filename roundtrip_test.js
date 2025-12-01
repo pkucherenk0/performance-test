@@ -23,7 +23,7 @@ const timeToBalanceUSD = new Trend('time_to_balance_usd');
 
 export const options = {
   vus: 1, // Should match the number of users in your JSON file (or be a multiple)
-  duration: '10s', 
+  duration: '1s', 
 };
 
 export default function () {
