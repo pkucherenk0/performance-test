@@ -22,8 +22,8 @@ const timeToBalanceETH = new Trend('time_to_balance_eth');
 const timeToBalanceUSD = new Trend('time_to_balance_usd');
 
 export const options = {
-  vus: 1, // Should match the number of users in your JSON file (or be a multiple)
-  duration: '1s', 
+  vus: 2, // Should match the number of users in your JSON file (or be a multiple)
+  duration: '60s', 
 };
 
 export default function () {
@@ -79,9 +79,9 @@ export default function () {
             "market": "ETHYTEST.USD",
             "side": "buy",
             "amount": "0.00000001",
-            "price": "2000", // Price to ensure instant match
-            "type": "limit",
-            "time_in_force": "gtc"
+            //"price": "2000", 
+            "type": "market",
+            "time_in_force": "ioc"
           });
     
           const params = {
@@ -119,7 +119,8 @@ export default function () {
             const now = Date.now();
 
             // 1. CHECK FOR TRADE EXECUTION
-            if (data.header && data.header.type === 'order.updated' && data.uuid === orderUuid) {
+            if (data.header && data.header.type === 'order.updated' && data.order_id
+ === orderUuid) {
                 if (data.state === 'done' && !eventsReceived.tradeDone) {
                     const duration = now - startTime;
                     timeToTradeDone.add(duration);
