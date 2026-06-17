@@ -1,115 +1,68 @@
-import http from 'k6/http';
-import { check, sleep } from 'k6';
-import { Trend, Counter } from 'k6/metrics';
-import crypto from 'k6/crypto';
-import { config, users } from './config.js';
+// Orderbook populate — PERP only — for pagination / depth testing.
+//
+// Each VU iteration places one resting LIMIT order (gtc) on POST /perpetual/order,
+// priced around PERP_CENTER so it rests on the book instead of filling.
+//
+// Exports populatePerp(user, isBuy) so orderbook_populate.js can reuse it.
+//
+// Credentials: users.<env>.json (same dir, git-ignored):
+//   [{ apiKey, apiSecret, sessionId, userAddress }]
+//
+// --- HOW TO RUN -------------------------------------------------------------
+//   cd performance-test/APIkeyBased
+//
+//   k6 run perp_orderbook_populate.js                       # 60s, UAT (default)
+//   k6 run -e ENV=stage perp_orderbook_populate.js          # against stage
+//   k6 run --vus 1 --iterations 100 perp_orderbook_populate.js   # exactly 100 orders
+//   k6 run -e PERP_CENTER=1679 perp_orderbook_populate.js   # tune to live mark
+//
+// Env knobs (all optional):
+//   ENV=uat|stage   ACTIVE_USERS=1   SPAM_DELAY_MS=10   VUS / DURATION
+//   SIDE=buy|sell|alt (def alt)   BASE_URL PERP_MARKET (from config.js)
+//   PERP_CENTER PERP_RANGE PERP_AMOUNT PERP_DECIMALS LEVERAGE MARGIN_MODE
+// ---------------------------------------------------------------------------
 
-// --- CONFIGURATION (env-driven; see config.js) ---
-const BASE_URL = config.baseUrl;
-const MARKET = config.perpMarket;
-const SPAM_DELAY_MS = 10;
+import { sleep } from 'k6';
+import { config } from './config.js';
+import {
+  SPAM_DELAY_MS, options as commonOptions,
+  pickUser, chooseSide, submitOrder, restingPrice,
+} from './populate_common.js';
 
-// Number of users to use from users.json (1 = only the first user, 2 = first two, etc.)
-// Override via env: k6 run -e ACTIVE_USERS=3 perp_orderbook_populate.js
-const ACTIVE_USERS = parseInt(__ENV.ACTIVE_USERS || '1', 10);
+// Re-export so `k6 run perp_orderbook_populate.js` honors VUS/DURATION env.
+export const options = commonOptions;
 
-// --- PRICING CONFIG ---
-const CENTER_PRICE = 1679;
-const PRICE_RANGE = 100; // buys: CENTER-1 to CENTER-RANGE, sells: CENTER+1 to CENTER+RANGE
+// --- PERP config (env-driven) ---
+const PERP_MARKET = config.perpMarket;
+const PERP_CENTER = parseFloat(__ENV.PERP_CENTER || '1679');
+const PERP_RANGE = parseInt(__ENV.PERP_RANGE || '100', 10); // integer ticks off center
+const PERP_AMOUNT = __ENV.PERP_AMOUNT || '0.01';
+const PERP_DECIMALS = parseInt(__ENV.PERP_DECIMALS || '2', 10);
+const LEVERAGE = __ENV.LEVERAGE || '10';
+const MARGIN_MODE = __ENV.MARGIN_MODE || 'cross';
 
-// --- METRICS ---
-const ordersPlaced = new Counter('orders_placed');
-const orderErrors = new Counter('order_errors');
-const orderLatency = new Trend('order_latency_ms');
-
-function log(msg, type = 'INFO') {
-  const time = new Date().toISOString().split('T')[1].replace('Z', '');
-  const icons = { INFO: 'ℹ️', SUCCESS: '✅', WARN: '⚠️', ERROR: '❌', SEND: '📤' };
-  console.log(`${icons[type] || ''} [${time}] VU${__VU}: ${msg}`);
-}
-
-function getAuthHeaders(apiKey, apiSecret, method, url, bodyObject = {}) {
-  if (!apiKey || !apiSecret) throw new Error('Missing API Key/Secret');
-  const timestamp = Math.floor(Date.now() / 1000).toString();
-  let path = url.replace(/^(?:https?:\/\/|wss?:\/\/)[^\/]+/, '');
-  if (!path.startsWith('/')) path = '/' + path;
-  const methodUpper = method.toUpperCase();
-  let canonicalFieldString = '';
-  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(methodUpper)) {
-    try {
-      const sortedKeys = Object.keys(bodyObject).sort();
-      canonicalFieldString = sortedKeys.map(key => `${key}=${bodyObject[key]}`).join('|');
-    } catch (e) {}
-  }
-  const prehash = methodUpper + path + timestamp + canonicalFieldString;
-  const signature = crypto.hmac('sha256', apiSecret, prehash, 'hex');
-  return {
-    'Content-Type': 'application/json',
-    'X-API-KEY': apiKey,
-    'X-TIMESTAMP': timestamp,
-    'X-SIGNATURE': signature,
-  };
-}
-
-export const options = {
-  vus: 1,
-  duration: '60s',
-};
-
-export default function () {
-  // Use only the first ACTIVE_USERS entries; distribute VUs round-robin across that slice
-  const activeCount = Math.min(ACTIVE_USERS, users.length);
-  const userIndex = (__VU - 1) % activeCount;
-  const currentUser = users[userIndex];
-
-  if (!currentUser) {
-    log('No user found in users.json', 'ERROR');
-    return;
-  }
-
-  const { apiKey: API_KEY, apiSecret: API_SECRET, sessionId: APP_SESSION_ID } = currentUser;
-
-  // Alternate buy and sell within each VU iteration
-  // Odd iterations → buy below center, Even iterations → sell above center
-  const isBuy = __ITER % 2 === 0;
+// Place one resting perp limit order. Reused by the "all" script.
+export function populatePerp(user, isBuy) {
   const side = isBuy ? 'buy' : 'sell';
   const direction = isBuy ? 'long' : 'short';
-
-  // Buys: center-RANGE to center-1 (all below center, won't cross asks)
-  // Sells: center+1 to center+RANGE (all above center, won't cross bids)
-  const offset = Math.floor(Math.random() * PRICE_RANGE) + 1;
-  const rawPrice = isBuy ? (CENTER_PRICE - offset) : (CENTER_PRICE + offset);
-  const price = rawPrice.toFixed(2);
-
   const payload = {
-    app_session_id: APP_SESSION_ID,
-    market: MARKET,
-    margin_mode: 'cross',
-    side: side,
-    direction: direction,
-    leverage: '10',
-    amount: '0.01',
-    price: price,
+    app_session_id: user.sessionId,
+    market: PERP_MARKET,
+    margin_mode: MARGIN_MODE,
+    side,
+    direction,
+    leverage: LEVERAGE,
+    amount: PERP_AMOUNT,
+    price: restingPrice(isBuy, PERP_CENTER, PERP_RANGE, PERP_DECIMALS),
     type: 'limit',
     time_in_force: 'gtc',
   };
+  return submitOrder('perp', '/perpetual/order', user, payload, `${side.toUpperCase()} ${direction}`);
+}
 
-  const url = `${BASE_URL}/perpetual/order`;
-  const headers = getAuthHeaders(API_KEY, API_SECRET, 'POST', url, payload);
-
-  const start = Date.now();
-  const res = http.post(url, JSON.stringify(payload), { headers: headers });
-  orderLatency.add(Date.now() - start);
-
-  const ok = check(res, { 'order accepted (200)': r => r.status === 200 });
-
-  if (ok) {
-    ordersPlaced.add(1);
-    log(`${side.toUpperCase()} ${direction} @ ${price} → OK`, 'SEND');
-  } else {
-    orderErrors.add(1);
-    log(`${side.toUpperCase()} ${direction} @ ${price} FAILED | ${res.status} | ${res.body}`, 'ERROR');
-  }
-
+export default function () {
+  const user = pickUser();
+  if (!user) return;
+  populatePerp(user, chooseSide());
   sleep(SPAM_DELAY_MS / 1000);
 }
