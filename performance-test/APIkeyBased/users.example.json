@@ -1,0 +1,8 @@
+[
+  {
+    "apiKey": "YOUR_API_KEY",
+    "apiSecret": "YOUR_API_SECRET",
+    "sessionId": "0xYOUR_SESSION_ID",
+    "userAddress": "0xYOUR_WALLET_ADDRESS"
+  }
+]

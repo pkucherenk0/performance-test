@@ -1,0 +1,6 @@
+[
+  {
+    "jwt": "YOUR_JWT_TOKEN",
+    "sessionId": "0xYOUR_SESSION_ID"
+  }
+]

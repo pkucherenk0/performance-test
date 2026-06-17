@@ -1,0 +1,22 @@
+# --- Credentials & secrets (NEVER commit) ---
+users.json
+users.*.json
+!users.example.json
+*.pem
+*.key
+.env
+.env.*
+
+# --- Generated competition output (contains real wallets / JWTs) ---
+competition/wallet-jwts-*.json
+competition/enrollments-*.json
+
+# --- Local tooling / editor state ---
+.claude/
+**/.claude/
+.DS_Store
+
+# --- Node ---
+node_modules/
+npm-debug.log*
+yarn-error.log*
