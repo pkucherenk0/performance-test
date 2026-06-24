@@ -1,0 +1,10 @@
+[
+  {
+    "label": "subject",
+    "privateKey": "0xYOUR_FUNDED_WALLET_PRIVATE_KEY_1"
+  },
+  {
+    "label": "maker",
+    "privateKey": "0xYOUR_FUNDED_WALLET_PRIVATE_KEY_2"
+  }
+]
