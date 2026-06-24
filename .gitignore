@@ -10,6 +10,8 @@ users.*.json
 # --- Generated competition output (contains real wallets / JWTs) ---
 competition/wallet-jwts-*.json
 competition/enrollments-*.json
+competition/fee-verify-*.json
+competition/results/
 
 # --- Local tooling / editor state ---
 .claude/
