@@ -7,7 +7,7 @@ const { sleep } = require('../lib/http');
 const { getMarkPrice, sizeAmount, roundTick, createOrder } = require('../lib/market');
 const { getFeeTierEffective, waitForFill } = require('../lib/fees');
 const { close } = require('../lib/tiers');
-const { C } = require('../lib/checks');
+const { C, sid } = require('../lib/checks');
 
 async function phaseNonEnrolled(ctx) {
   const { rl, opts, mkt, subject, maker } = ctx;
@@ -28,9 +28,10 @@ async function phaseNonEnrolled(ctx) {
     standardPerpTaker: mEff?.standardPerpTaker ?? null, effPerpTaker: mEff?.effPerpTaker ?? null,
     standardPerpMaker: mEff?.standardPerpMaker ?? null, effPerpMaker: mEff?.effPerpMaker ?? null,
     takerFillRate: mFill?.effRate ?? null, takerFillIsMaker: mFill?.isMaker ?? null,
+    takerOrderUuid: mFill?.orderUuid ?? null, takerTradeIds: mFill?.tradeIds ?? [],
   };
   ctx.nonEnrolledResult = nonEnrolledResult;
-  console.log(`\nNon-enrolled counterparty (maker): enroll=${maker.enroll} overlayActive=${mEff?.overlayActive} | effective taker ${mEff?.effPerpTaker != null ? (mEff.effPerpTaker * 100).toFixed(4) + '%' : '-'} vs standard ${mEff?.standardPerpTaker != null ? (mEff.standardPerpTaker * 100).toFixed(4) + '%' : '-'} | maker taker fill charged ${mFill?.effRate != null ? (mFill.effRate * 100).toFixed(4) + '%' : 'n/a'}`);
+  console.log(`\nNon-enrolled counterparty (maker): enroll=${maker.enroll} overlayActive=${mEff?.overlayActive} | effective taker ${mEff?.effPerpTaker != null ? (mEff.effPerpTaker * 100).toFixed(4) + '%' : '-'} vs standard ${mEff?.standardPerpTaker != null ? (mEff.standardPerpTaker * 100).toFixed(4) + '%' : '-'} | maker taker fill charged ${mFill?.effRate != null ? (mFill.effRate * 100).toFixed(4) + '%' : 'n/a'}${mFill ? ` | trade ${sid(nonEnrolledResult.takerOrderUuid)} fill ${nonEnrolledResult.takerTradeIds.length ? sid(nonEnrolledResult.takerTradeIds[0]) : '—'}` : ''}`);
 
   checks.push(C('non-enrolled user: competition overlay NOT active', nonEnrolledResult.overlayActive === false, { enroll: nonEnrolledResult.enroll, overlayActive: nonEnrolledResult.overlayActive }));
   const effEqStd = nonEnrolledResult.effPerpTaker != null && nonEnrolledResult.standardPerpTaker != null

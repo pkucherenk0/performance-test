@@ -21,7 +21,7 @@ const DEFAULTS = {
   minPerpUsd: 20000,                // stage: required perp collateral per account (no faucet to top up)
   feeTiersUrl: 'https://yellow-neodax-client-uat.openware-account.workers.dev/fee-tiers',
   scheduleKey: 'initialSchedule',   // RSC key holding the tier array; set to the competition key when known
-  competition: 'pablo-15',
+  competition: 'pablo-17',
 
   market: 'BTCUSDT-PERP',           // resolved against /perpetual/exchangeInfo
   makerEnroll: false,               // maker = the NON-ENROLLED counterparty (trades perp, must get standard fees only)
@@ -63,9 +63,11 @@ const DEFAULTS = {
   yellowMarket: 'YELLOWUSDT',       // spot market used to sell YELLOW from subject -> maker
   yellowSellPrice: '0.01',          // limit price for both the maker's YELLOW bid and the subject's crossing sell
 
-  // --- Phase 6: base-VIP vs overlay crossover (best-of from the "standard is better" side) ---
-  baseVip: true,                    // verify a better base VIP is kept until the overlay beats it (uat only; auto-skips on stage)
+  // --- Phase 6: base-VIP vs overlay crossover (autonomous, dedicated accounts; uat only) ---
+  baseVip: true,                    // verify a better base VIP is kept until the overlay beats it (auto-skips on stage)
+  baseVipTargetTier: null,          // optional: raise the dedicated account's STANDARD tier to this competition-tier rate via pre-enrollment volume (null = use the fresh base, already better than the competition base tier)
 
+  debug: false,                     // false = clean test-report output; true (--debug/--verbose) = full per-fill firehose
   rps: 6,
   maxRetries: 5,
   delay: 200,
@@ -101,6 +103,7 @@ Usage:
 
 Common flags: --env --competition --market --target-tier --target-volume --order-notional
   --marker-fills --watch-secs --no-yellow --no-spot-check --no-yellow-decrease --no-base-vip --epsilon --rps
+  --debug (full per-fill firehose; default output is a clean test report)
 Output: ./results/fee-verify-<competition>-<ts>.json`;
 
 function parseArgs(argv) {
@@ -153,6 +156,9 @@ function parseArgs(argv) {
       case '--yellow-sell-price': out.yellowSellPrice = next; i++; break;
       case '--base-vip':        out.baseVip = next !== 'false'; i++; break;
       case '--no-base-vip':     out.baseVip = false; break;
+      case '--base-vip-target-tier': out.baseVipTargetTier = parseInt(next, 10); i++; break;
+      case '--debug':
+      case '--verbose':         out.debug = true; break;
       case '--rps':             out.rps = parseFloat(next); i++; break;
       case '--delay':           out.delay = parseInt(next, 10); i++; break;
       case '--epsilon':         out.feeEpsilon = parseFloat(next); i++; break;

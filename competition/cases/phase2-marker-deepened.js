@@ -9,7 +9,7 @@ const { sleep, getJson } = require('../lib/http');
 const { getFeeTierEffective } = require('../lib/fees');
 const { fetchCompetition } = require('../lib/competition-api');
 const { expectedCompTier, close, floorEff } = require('../lib/tiers');
-const { C, pct, logSides, bandCheck } = require('../lib/checks');
+const { C, pct, logTrade, logSides, bandCheck, dbg } = require('../lib/checks');
 const { takerFill } = require('../lib/trade');
 
 async function phaseMarkerFills(ctx) {
@@ -36,10 +36,11 @@ async function phaseMarkerFills(ctx) {
       if (o.skip) { console.warn(`  catch-up ${attempts} skipped: ${o.reason}`); await sleep(opts.delay || 200); continue; }
       if (opts.delay) await sleep(opts.delay);
       const c = await takerFill(ctx, false, 2, false);
-      console.log(`  catch-up ${attempts}  campaignVol ${o.row.overlayCampaignVol != null ? '$' + Math.round(o.row.overlayCampaignVol).toLocaleString() : 'pending'}`);
-      logSides(o.row);
+      dbg(`  catch-up ${attempts}  campaignVol ${o.row.overlayCampaignVol != null ? '$' + Math.round(o.row.overlayCampaignVol).toLocaleString() : 'pending'}`);
+      { const tg = logTrade(ctx.fillLog, o.row, eps); if (tg !== 'exec') logSides(o.row); }
+      if (c.row) logTrade(ctx.fillLog, c.row, eps);
       engineCaughtUp = close(o.row.observedRate, deepenedTaker, eps) || (c.row && close(c.row.observedRate, deepenedTaker, eps));
-      if (!engineCaughtUp) { console.log(`  engine not caught up (charged ${pct(o.row.observedRate)} vs deepened ${pct(deepenedTaker)}); waiting ${opts.yellowPollSecs}s...`); await sleep(opts.yellowPollSecs * 1000); }
+      if (!engineCaughtUp) { dbg(`  engine not caught up (charged ${pct(o.row.observedRate)} vs deepened ${pct(deepenedTaker)}); waiting ${opts.yellowPollSecs}s...`); await sleep(opts.yellowPollSecs * 1000); }
     }
     if (!engineCaughtUp) console.warn(`  ⚠️  engine did not reach the deepened taker rate within ${opts.watchSecs}s; phase-2 assertions will reflect the lag.`);
 
@@ -55,9 +56,9 @@ async function phaseMarkerFills(ctx) {
       const om = await takerFill(ctx, true, 2, true);           // subject rests (maker), counterparty takes
       if (!om.skip && opts.delay) await sleep(opts.delay);
       if (!om.skip) await takerFill(ctx, false, 2, true);
-      console.log(`  m${i + 1}:`);
-      if (!ot.skip) logSides(ot.row);
-      if (!om.skip) logSides(om.row);
+      dbg(`  m${i + 1}:`);
+      if (!ot.skip) { const tg = logTrade(ctx.fillLog, ot.row, eps); if (tg !== 'exec') logSides(ot.row); }
+      if (!om.skip) { const tg = logTrade(ctx.fillLog, om.row, eps); if (tg !== 'exec') logSides(om.row); }
       if (opts.delay) await sleep(opts.delay);
     }
   }
@@ -263,6 +264,45 @@ async function phaseMarkerFills(ctx) {
     checks.push(C('regression guard (charged): a real subject fill was charged the overlay discount, not base VIP', true, 'no cheaper overlay available to charge (see r1 for classification)', true));
   }
 
+  // (r1m) MAKER-SIDE base-VIP override guard — the mirror of r1 for the maker side, which otherwise
+  //       has NO hard best-of invariant (its band check tolerates any in-envelope rate, so a maker
+  //       fill charged the higher STANDARD rate while a cheaper overlay was active would slip through).
+  //       Timing-independent: when the overlay maker rate is active and strictly cheaper than standard,
+  //       the SETTLED maker effective MUST equal the overlay best-of, never the standard maker rate.
+  const stdMakerNow2 = finalEff?.standardPerpMaker ?? opts.stdMakerRate ?? null;
+  const overlayMakerBestOf = finalEff && finalEff.overlayActive && finalEff.overlayPerpMaker != null && finalEff.standardPerpMaker != null
+    ? Math.min(finalEff.standardPerpMaker, finalEff.overlayPerpMaker) : null;
+  const makerDiscountAvailable = !!finalEff?.overlayActive && overlayMakerBestOf != null && stdMakerNow2 != null && overlayMakerBestOf < stdMakerNow2 * (1 - eps);
+  if (makerDiscountAvailable && finalEff.effPerpMaker != null) {
+    const overriddenM = close(finalEff.effPerpMaker, stdMakerNow2, eps) && !close(finalEff.effPerpMaker, overlayMakerBestOf, eps);
+    checks.push(C('regression guard (maker): active cheaper overlay maker rate is NOT overridden by base VIP (maker effective == overlay best-of, not standard)', !overriddenM,
+      overriddenM
+        ? { verdict: 'BASE-VIP OVERRIDE on maker side — overlay maker discount wiped by standard maker rate', standardMaker: stdMakerNow2, overlayMakerBestOf, settledEffectiveMaker: finalEff.effPerpMaker }
+        : { verdict: 'maker discount applied', overlayMakerBestOf, settledEffectiveMaker: finalEff.effPerpMaker, standardMaker: stdMakerNow2 }));
+  } else {
+    const whyM = !finalEff?.overlayActive
+      ? `overlay not active yet — base VIP maker rate is correct here (benign delay, not an override)`
+      : `overlay active but its maker best-of (${pct(overlayMakerBestOf)}) is not cheaper than standard maker (${pct(stdMakerNow2)}) — nothing for base VIP to override`;
+    checks.push(C('regression guard (maker): active cheaper overlay maker rate is NOT overridden by base VIP (maker effective == overlay best-of, not standard)', true, whyM, true));
+  }
+
+  // (r2m) CHARGED-FEE confirmation of the maker guard — gated on the engine having caught up, so a
+  //       slow ingestion delay is reported as info while a discount that had time to apply but was
+  //       charged at the standard maker rate FAILS. Closes the band-tolerance gap on the charged side.
+  const bestChargedMaker = subjMakerRows.length ? Math.min(...subjMakerRows.map((r) => r.makerObservedRate).filter((v) => v != null)) : null;
+  if (makerDiscountAvailable && engineCaughtUp && bestChargedMaker != null) {
+    const realizedM = close(bestChargedMaker, overlayMakerBestOf, eps);
+    const stuckAtBaseM = close(bestChargedMaker, stdMakerNow2, eps) && !realizedM;
+    checks.push(C('regression guard (maker, charged): a real subject MAKER fill was charged the overlay discount, not base VIP', realizedM && !stuckAtBaseM,
+      { bestChargedSubjectMaker: bestChargedMaker, overlayMakerBestOf, standardMaker: stdMakerNow2, verdict: stuckAtBaseM ? 'BASE-VIP OVERRIDE on charged maker fee' : (realizedM ? 'maker discount charged' : 'neither — see band checks') }));
+  } else if (makerDiscountAvailable) {
+    checks.push(C('regression guard (maker, charged): a real subject MAKER fill was charged the overlay discount, not base VIP', true,
+      bestChargedMaker == null ? 'no subject maker fill captured to confirm the charged maker discount (role swap produced no clean maker fill)'
+                               : `DELAY (not a regression): engine did not reach the deepened maker rate within ${opts.watchSecs}s — overlay poll/ingestion lag`, true));
+  } else {
+    checks.push(C('regression guard (maker, charged): a real subject MAKER fill was charged the overlay discount, not base VIP', true, 'no cheaper overlay maker rate available to charge (see r1m for classification)', true));
+  }
+
   // (e) overlay tier rate matches the qualified competition tier at the final campaign volume.
   const qual = ctx.crossingObs.filter((c) => c.isQualified);
   if (qual.length > 0) {
@@ -277,20 +317,32 @@ async function phaseMarkerFills(ctx) {
   const volumeDelta = ctx.endTotalVolume - ctx.startTotalVolume;
   checks.push(C('competition total_volume_usd increased (volume ingested)', volumeDelta > 0, { startTotalVolume: ctx.startTotalVolume, endTotalVolume: ctx.endTotalVolume, volumeDelta: Math.round(volumeDelta), tradedVolume: Math.round(ctx.tradedVol), campaignVol: Math.round(ctx.campaignVol) }, true));
 
-  // (g) forward-only: re-read trades; the earliest fill's fee must be unchanged.
-  let forwardOnly = true, reRead = null;
-  if (filledRows.length) {
-    const url = `${opts.tradingBase.replace(/\/$/, '')}/perpetual/trades?app_session_id=${encodeURIComponent(subject.appSessionId)}&market=${encodeURIComponent(mkt.market)}&page_size=100`;
+  // (g) forward-only: re-read trades; the SUBJECT's earliest fill must read the same fee now.
+  //     Match it by its recorded order_uuid — positional trades[length-1] silently picks the WRONG
+  //     trade once the subject's trades exceed one page (this run hit 97 vs a 100-page), comparing
+  //     against a mid-run fill at a different tier. Request a generous page so the earliest order is
+  //     present; if it still isn't, report "not verifiable" (info) rather than asserting on a wrong row.
+  let forwardOnly = true, reRead = null, fwInfo = true;
+  const firstRow = filledRows.find((r) => !r.restIsSubject && r.takerOrderUuid);   // the first fill the SUBJECT took
+  if (firstRow) {
+    const url = `${opts.tradingBase.replace(/\/$/, '')}/perpetual/trades?app_session_id=${encodeURIComponent(subject.appSessionId)}&market=${encodeURIComponent(mkt.market)}&page_size=1000`;
     const r = await getJson(rl, url, { Authorization: `Bearer ${subject.jwt}` }, opts.maxRetries);
     const trades = Array.isArray(r.body?.trades) ? r.body.trades : [];
-    const oldest = trades[trades.length - 1];
-    if (oldest) {
-      const rate = parseFloat(oldest.fee) / (parseFloat(oldest.amount) * parseFloat(oldest.price));
-      reRead = { reReadRate: rate, firstObserved: filledRows[0].observedRate };
-      forwardOnly = close(rate, filledRows[0].observedRate, eps);
+    const firstTradeId = firstRow.takerTradeIds && firstRow.takerTradeIds[0];
+    const match = trades.filter((t) => t.order_uuid === firstRow.takerOrderUuid
+      || (firstTradeId && String(t.trade_id ?? t.id ?? t.uuid ?? t.trade_uuid ?? '') === firstTradeId));
+    if (match.length) {
+      const notional = match.reduce((s, t) => s + parseFloat(t.amount) * parseFloat(t.price), 0);
+      const fee = match.reduce((s, t) => s + parseFloat(t.fee), 0);
+      const rate = notional > 0 ? fee / notional : null;
+      forwardOnly = rate != null && close(rate, firstRow.observedRate, eps);
+      reRead = { reReadRate: rate, firstObserved: firstRow.observedRate, matchedOrder: firstRow.takerOrderUuid };
+      fwInfo = false;   // verifiable -> HARD check
+    } else {
+      reRead = { note: 'earliest subject order not returned in the trades page — forward-only not verifiable this run', firstOrder: firstRow.takerOrderUuid };
     }
   }
-  checks.push(C('forward-only: earliest fill not re-rated after later crossings', forwardOnly, reRead));
+  checks.push(C('forward-only: earliest fill not re-rated after later crossings', forwardOnly, reRead, fwInfo));
 
   return checks;
 }

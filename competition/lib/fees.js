@@ -37,7 +37,12 @@ async function getFeeTierEffective(rl, opts, jwt) {
   };
 }
 
-// Blend fills for one order_uuid -> { notional, fee, effRate, isMaker, fills }.
+// Blend fills for one order_uuid. A single order can fill across BOTH roles — e.g. a limit that
+// partially crosses the spread takes some liquidity (taker) before the remainder rests (maker). The
+// blended effRate then mixes two fee schedules and is NOT a valid single-role rate. So we also split
+// notional/fee by is_maker and expose role-pure rates: assert the maker side on makerEffRate (the
+// maker slice only) and the taker side on takerEffRate; mixedRoles flags an order that did both.
+// Returns { notional, fee, effRate, isMaker, fills, makerEffRate, takerEffRate, mixedRoles, ... }.
 async function getFillForOrder(rl, opts, jwt, appSessionId, market, orderUuid) {
   const url = `${opts.tradingBase.replace(/\/$/, '')}/perpetual/trades?app_session_id=${encodeURIComponent(appSessionId)}&market=${encodeURIComponent(market)}&page_size=100`;
   const r = await getJson(rl, url, { Authorization: `Bearer ${jwt}` }, opts.maxRetries);
@@ -45,12 +50,23 @@ async function getFillForOrder(rl, opts, jwt, appSessionId, market, orderUuid) {
   const mine = trades.filter((t) => t.order_uuid === orderUuid);
   if (mine.length === 0) return null;
   let notional = 0, fee = 0, isMaker = false;
+  let mkNotional = 0, mkFee = 0, mkFills = 0, tkNotional = 0, tkFee = 0, tkFills = 0;
   for (const t of mine) {
-    notional += parseFloat(t.amount) * parseFloat(t.price);
-    fee += parseFloat(t.fee);
-    if (t.is_maker) isMaker = true;
+    const n = parseFloat(t.amount) * parseFloat(t.price);
+    const f = parseFloat(t.fee);
+    notional += n; fee += f;
+    if (t.is_maker) { isMaker = true; mkNotional += n; mkFee += f; mkFills++; }
+    else { tkNotional += n; tkFee += f; tkFills++; }
   }
-  return { notional, fee, effRate: notional > 0 ? fee / notional : 0, isMaker, fills: mine.length };
+  // Per-fill trade ids that composed this order's fill (best-effort across field names); the
+  // order_uuid is always present and is the primary trade identifier we surface in logs.
+  const tradeIds = mine.map((t) => t.trade_id ?? t.id ?? t.uuid ?? t.trade_uuid ?? null).filter((x) => x != null).map(String);
+  return {
+    notional, fee, effRate: notional > 0 ? fee / notional : 0, isMaker, fills: mine.length, orderUuid, tradeIds,
+    makerEffRate: mkNotional > 0 ? mkFee / mkNotional : null,
+    takerEffRate: tkNotional > 0 ? tkFee / tkNotional : null,
+    makerFills: mkFills, takerFills: tkFills, mixedRoles: mkFills > 0 && tkFills > 0,
+  };
 }
 
 async function waitForFill(rl, opts, jwt, appSessionId, market, orderUuid) {

@@ -5,6 +5,7 @@ const { sleep } = require('./http');
 const { getMarkPrice, getPerpTopOfBook, sizeAmount, roundTick, createOrder } = require('./market');
 const { getFeeTierEffective, getFillForOrder, waitForFill } = require('./fees');
 const { close } = require('./tiers');
+const { recordWarn } = require('./checks');
 
 // One round of a market-vs-limit match. By default the enrolled SUBJECT takes (market) and the
 // counterparty rests (maker). swap=true FLIPS the roles so we also observe the enrolled subject's
@@ -70,27 +71,36 @@ async function takerFill(ctx, subjBuys, phase = 1, swap = false) {
 
   // best-of of the COMPONENT tiers (standard, overlay-if-active) for each side. The matching engine
   // charges this in real time; the endpoint's own `effective` field can lag behind it.
+  // Role-pure charged rates. An order that fills across both roles (a limit that partially crosses
+  // the spread) blends two fee schedules in effRate; assert each side on its OWN slice so a partial
+  // cross doesn't pollute the other side's rate. The taker market order is pure taker, but fall back
+  // symmetrically. A mixed maker order is expected behaviour, not a bug — surface it as a warning.
+  const takerRate = fill.takerEffRate ?? fill.effRate;
+  const makerRate = makerFill ? (makerFill.makerEffRate ?? makerFill.effRate) : null;
+  if (makerFill?.mixedRoles) recordWarn(ctx, `cycle ${ctx.cycle} maker order ${m.orderUuid.slice(0, 10)} partially crossed (${makerFill.makerFills} maker + ${makerFill.takerFills} taker fills) — measuring the maker slice only`);
+
   const expectedBestOf = takerEff ? (takerEff.overlayActive ? Math.min(takerEff.standardPerpTaker, takerEff.overlayPerpTaker) : takerEff.standardPerpTaker) : null;
-  const chargedIsBestOf = takerEff && expectedBestOf != null && close(fill.effRate, expectedBestOf, opts.feeEpsilon);
-  const chargedMatchesEffField = takerEff && close(fill.effRate, takerEff.effPerpTaker, opts.feeEpsilon);
+  const chargedIsBestOf = takerEff && expectedBestOf != null && close(takerRate, expectedBestOf, opts.feeEpsilon);
+  const chargedMatchesEffField = takerEff && close(takerRate, takerEff.effPerpTaker, opts.feeEpsilon);
   const effFieldIsBestOf = takerEff && expectedBestOf != null && close(takerEff.effPerpTaker, expectedBestOf, opts.feeEpsilon);
   const makerExpectedMaker = restEff ? (restEff.overlayActive ? Math.min(restEff.standardPerpMaker, restEff.overlayPerpMaker) : restEff.standardPerpMaker) : null;
-  const makerChargedIsBestOf = makerFill && makerExpectedMaker != null && close(makerFill.effRate, makerExpectedMaker, opts.feeEpsilon);
+  const makerChargedIsBestOf = makerFill && makerExpectedMaker != null && close(makerRate, makerExpectedMaker, opts.feeEpsilon);
 
   const row = {
     cycle: ctx.cycle, phase, subjBuys, swap, restIsSubject: swap,
     subjRole: swap ? 'maker' : 'taker',
-    subjRate: swap ? (makerFill?.effRate ?? null) : fill.effRate,
+    subjRate: swap ? makerRate : takerRate,
     subjExpectedBestOf: swap ? makerExpectedMaker : expectedBestOf,
     isMaker: fill.isMaker, fillNotional: Math.round(fill.notional), fee: fill.fee,
     // taker side (whoever took)
-    observedRate: fill.effRate,
+    observedRate: takerRate, takerMixedRoles: !!fill.mixedRoles,
     effPerpTaker: takerEff?.effPerpTaker ?? null, standardPerpTaker: takerEff?.standardPerpTaker ?? null,
     takerOverlayActive: takerEff?.overlayActive ?? null, overlayPerpTaker: takerEff?.overlayPerpTaker ?? null,
     expectedBestOf, chargedIsBestOf, chargedMatchesEffField, effFieldIsBestOf,
     // maker side (whoever rested)
     makerFee: makerFill?.fee ?? null,
-    makerObservedRate: makerFill?.effRate ?? null,
+    makerObservedRate: makerRate,
+    makerMixedRoles: !!makerFill?.mixedRoles,
     makerIsMaker: makerFill?.isMaker ?? null,
     makerFillNotional: makerFill ? Math.round(makerFill.notional) : null,
     makerStandardPerpMaker: restEff?.standardPerpMaker ?? null,
@@ -100,6 +110,12 @@ async function takerFill(ctx, subjBuys, phase = 1, swap = false) {
     // enrolled-subject overlay/campaign fields (ALWAYS the subject, independent of role)
     overlayActive: subjEff?.overlayActive ?? null, overlayPerpTaker_subject: subjEff?.overlayPerpTaker ?? null,
     overlayCampaignVol: subjEff?.overlayCampaignVol ?? null, overlaySlug: subjEff?.overlaySlug ?? null,
+    // trade identifiers: per-side order_uuid + underlying fill trade ids. subj* point at whichever
+    // order the enrolled subject placed this fill (taker order when it took, maker order when it rested).
+    takerOrderUuid: s.orderUuid, makerOrderUuid: m.orderUuid,
+    takerTradeIds: fill?.tradeIds ?? [], makerTradeIds: makerFill?.tradeIds ?? [],
+    subjOrderUuid: swap ? m.orderUuid : s.orderUuid,
+    subjTradeIds: swap ? (makerFill?.tradeIds ?? []) : (fill?.tradeIds ?? []),
   };
   ctx.timeline.push(row);
   return { fill, row, subjEff, makerFill };

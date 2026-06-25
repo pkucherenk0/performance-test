@@ -8,7 +8,7 @@ const { faucet } = require('../lib/accounts');
 const { getFeeTierEffective } = require('../lib/fees');
 const { getSpotFeeRate, getSpotReferencePrice, createSpotOrder, countSpotTrades } = require('../lib/spot');
 const { close } = require('../lib/tiers');
-const { C } = require('../lib/checks');
+const { C, sid, dbg } = require('../lib/checks');
 
 async function phaseSpotSanity(ctx) {
   const { rl, opts, subject, maker } = ctx;
@@ -23,12 +23,12 @@ async function phaseSpotSanity(ctx) {
   if (spotInComp && effNow?.overlayActive && ovSpot != null && stdSpot != null && ovSpot < stdSpot * (1 - opts.feeEpsilon)) {
     const sDeadline = Date.now() + opts.watchSecs * 1000;
     while (Date.now() < sDeadline && !(spotRate?.takerRate != null && close(spotRate.takerRate, ovSpot, opts.feeEpsilon))) {
-      console.log(`    spot taker ${spotRate?.takerRate != null ? (spotRate.takerRate * 100).toFixed(4) + '%' : '-'} (want overlay ${(ovSpot * 100).toFixed(4)}%); waiting for spot discount to ingest...`);
+      dbg(`    spot taker ${spotRate?.takerRate != null ? (spotRate.takerRate * 100).toFixed(4) + '%' : '-'} (want overlay ${(ovSpot * 100).toFixed(4)}%); waiting for spot discount to ingest...`);
       await sleep(opts.yellowPollSecs * 1000);
       spotRate = await getSpotFeeRate(rl, opts, subject.jwt, subject.appSessionId, opts.spotMarket);
     }
   }
-  let spotFilled = false, spotErr = null;
+  let spotFilled = false, spotErr = null, spotSellUuid = null, spotMakerUuid = null;
   // The spot fee-rate assertions (s1–s3) are authoritative and don't need a fill. The sanity fill
   // needs spot inventory on both accounts; on a no-faucet env there's none (collateral was swept to
   // perps), so skip the fill cleanly there rather than firing an order that just rejects.
@@ -45,6 +45,7 @@ async function phaseSpotSanity(ctx) {
       await sleep(300);
       const sj = mk.ok ? await createSpotOrder(rl, opts, subject.jwt, subject.appSessionId, { market: opts.spotMarket, side: 'sell', type: 'market', amount: amt }) : { ok: false, error: 'maker bid rejected: ' + mk.error };
       spotErr = sj.ok ? null : sj.error;
+      spotSellUuid = sj.orderUuid; spotMakerUuid = mk.orderUuid;
       if (sj.ok) { await sleep(1500); spotFilled = (await countSpotTrades(rl, opts, subject.jwt, subject.appSessionId, opts.spotMarket)) > before; }
     } else {
       spotErr = `no spot price (${spotPx}) or base faucet failed`;
@@ -55,10 +56,10 @@ async function phaseSpotSanity(ctx) {
     spotEffectiveTaker: spotRate?.takerRate ?? null, spotRateSource: spotRate?.source ?? null,
     standardSpotTaker: effNow?.standardSpotTaker ?? null, overlaySpotTaker: effNow?.overlaySpotTaker ?? null,
     effSpotTaker: effNow?.effSpotTaker ?? null, overlayActive: effNow?.overlayActive ?? null,
-    filled: spotFilled, error: spotErr,
+    filled: spotFilled, error: spotErr, sellOrderUuid: spotSellUuid, makerOrderUuid: spotMakerUuid,
   };
   ctx.spotResult = spotResult;
-  console.log(`  spot effective taker ${spotRate?.takerRate != null ? (spotRate.takerRate * 100).toFixed(4) + '%' : '-'} (src ${spotRate?.source}) | standard ${effNow?.standardSpotTaker != null ? (effNow.standardSpotTaker * 100).toFixed(4) + '%' : '-'} | overlay ${effNow?.overlaySpotTaker != null ? (effNow.overlaySpotTaker * 100).toFixed(4) + '%' : '-'} | fill ${spotFilled ? 'ok' : 'no (' + spotErr + ')'}`);
+  console.log(`  spot effective taker ${spotRate?.takerRate != null ? (spotRate.takerRate * 100).toFixed(4) + '%' : '-'} (src ${spotRate?.source}) | standard ${effNow?.standardSpotTaker != null ? (effNow.standardSpotTaker * 100).toFixed(4) + '%' : '-'} | overlay ${effNow?.overlaySpotTaker != null ? (effNow.overlaySpotTaker * 100).toFixed(4) + '%' : '-'} | fill ${spotFilled ? 'ok' : 'no (' + spotErr + ')'}${spotSellUuid ? ` | trade ${sid(spotSellUuid)} (maker bid ${sid(spotMakerUuid)})` : ''}`);
 
   // (s1) PRIMARY, lag-robust: does the competition overlay touch spot? When the overlay spot rate
   //      is cheaper than standard (it WOULD change the outcome if applied) we can tell from the live fee:
@@ -94,7 +95,7 @@ async function phaseSpotSanity(ctx) {
   const s3 = se != null && expectedSpot != null && close(se, expectedSpot, opts.feeEpsilon);
   checks.push(C('spot effective == expected best-of spot rate (fee-tier-effective fields lag live tier)', s3, { spotEffectiveTaker: se, expectedSpot, standardSpotTakerField: st, overlaySpotTaker: ov, note: 'mismatch = a fee-tier-effective field trailing the live tier' }, true));
   // (s4) a real spot fill executed — INFO (/spot/trades exposes no per-fill fee; the rate checks above are authoritative).
-  checks.push(C('spot sanity trade executed (per-fill fee not exposed by /spot/trades)', spotResult.filled || !opts.faucet, spotResult.filled ? 'spot fill confirmed' : `no spot fill: ${spotResult.error}`, true));
+  checks.push(C('spot sanity trade executed (per-fill fee not exposed by /spot/trades)', spotResult.filled || !opts.faucet, spotResult.filled ? `spot fill confirmed (trade ${sid(spotResult.sellOrderUuid)}, maker bid ${sid(spotResult.makerOrderUuid)})` : `no spot fill: ${spotResult.error}`, true));
   return checks;
 }
 
