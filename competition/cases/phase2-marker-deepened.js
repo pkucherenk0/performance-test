@@ -16,6 +16,10 @@ async function phaseMarkerFills(ctx) {
   const { rl, opts, mkt, subject } = ctx;
   const eps = opts.feeEpsilon;
   let finalEff = ctx.finalEff;
+  // Did the per-account engine reach the deepened overlay rate within the catch-up window?
+  // Used by the base-VIP regression guard below to tell a genuine ingestion DELAY (engine never
+  // caught up) apart from an OVERRIDE (engine had time, discount available, base VIP persisted).
+  let engineCaughtUp = false;
   if (finalEff?.overlayActive && opts.markerFills > 0) {
     const deepenedTaker = floorEff(finalEff);                                                   // expected deepened taker best-of
     const deepenedMakerTarget = finalEff.overlayActive ? Math.min(finalEff.standardPerpMaker, finalEff.overlayPerpMaker) : finalEff.standardPerpMaker;
@@ -25,8 +29,8 @@ async function phaseMarkerFills(ctx) {
     // deepened, so the first taker fills here can still be charged the previous tier.
     console.log(`  Waiting for the matching engine to catch up to the ingested campaign volume...`);
     const deadline = Date.now() + opts.watchSecs * 1000;
-    let caughtUp = false, attempts = 0;
-    while (!caughtUp && Date.now() < deadline && ctx.cycle < opts.maxOrders) {
+    let attempts = 0;
+    while (!engineCaughtUp && Date.now() < deadline && ctx.cycle < opts.maxOrders) {
       ctx.cycle++; attempts++;
       const o = await takerFill(ctx, true, 2, false);
       if (o.skip) { console.warn(`  catch-up ${attempts} skipped: ${o.reason}`); await sleep(opts.delay || 200); continue; }
@@ -34,10 +38,10 @@ async function phaseMarkerFills(ctx) {
       const c = await takerFill(ctx, false, 2, false);
       console.log(`  catch-up ${attempts}  campaignVol ${o.row.overlayCampaignVol != null ? '$' + Math.round(o.row.overlayCampaignVol).toLocaleString() : 'pending'}`);
       logSides(o.row);
-      caughtUp = close(o.row.observedRate, deepenedTaker, eps) || (c.row && close(c.row.observedRate, deepenedTaker, eps));
-      if (!caughtUp) { console.log(`  engine not caught up (charged ${pct(o.row.observedRate)} vs deepened ${pct(deepenedTaker)}); waiting ${opts.yellowPollSecs}s...`); await sleep(opts.yellowPollSecs * 1000); }
+      engineCaughtUp = close(o.row.observedRate, deepenedTaker, eps) || (c.row && close(c.row.observedRate, deepenedTaker, eps));
+      if (!engineCaughtUp) { console.log(`  engine not caught up (charged ${pct(o.row.observedRate)} vs deepened ${pct(deepenedTaker)}); waiting ${opts.yellowPollSecs}s...`); await sleep(opts.yellowPollSecs * 1000); }
     }
-    if (!caughtUp) console.warn(`  ⚠️  engine did not reach the deepened taker rate within ${opts.watchSecs}s; phase-2 assertions will reflect the lag.`);
+    if (!engineCaughtUp) console.warn(`  ⚠️  engine did not reach the deepened taker rate within ${opts.watchSecs}s; phase-2 assertions will reflect the lag.`);
 
     // Confirmation marker fills at the deepened tier — BOTH sides: subject TAKER (overlay taker) and
     // subject MAKER (overlay maker), so the deepened tier is proven from both sides for the subject.
@@ -211,6 +215,52 @@ async function phaseMarkerFills(ctx) {
     checks.push(C('phase-2 subject MAKER fill reached the deepened maker best-of rate (engine caught up)', reachedM, { deepenedMaker, p2MakerCharged: p2m.map((r) => r.makerObservedRate) }));
   } else {
     checks.push(C('phase-2 subject MAKER fill reached the deepened maker best-of rate (engine caught up)', true, 'no phase-2 subject maker fills captured', true));
+  }
+
+  // (r1) BASE-VIP OVERRIDE REGRESSION GUARD — timing-independent.
+  //
+  // The production bug (neodax fee_engine fix #1369) re-published the wallet's STANDARD VIP fee
+  // over an active competition session, so the effective rate snapped back to base VIP and the
+  // campaign discount was wiped. What was first read as a "delay" was actually this override.
+  //
+  // This guard isolates the override from a genuine delay using ONE settled endpoint reading and
+  // the best-of invariant alone (no dependence on catch-up timing): the effective rate is DEFINED
+  // as min(standard, overlay). So if the overlay is active AND strictly cheaper than standard, the
+  // effective rate MUST be that cheaper overlay rate. If it instead equals the standard rate, the
+  // discount was overridden by base VIP — a true regression, not lag.
+  //
+  // Benign DELAY is explicitly NOT failed here (it does not satisfy "active cheaper overlay"):
+  //   - overlay inactive (campaign volume not ingested yet)        -> base VIP is the correct answer
+  //   - overlay active but not cheaper than standard               -> nothing to override
+  const stdNow = finalEff?.standardPerpTaker ?? opts.stdTakerRate ?? null;
+  const overlayBestOf = finalEff && finalEff.overlayActive ? floorEff(finalEff) : null;
+  const discountAvailable = !!finalEff?.overlayActive && overlayBestOf != null && stdNow != null && overlayBestOf < stdNow * (1 - eps);
+  if (discountAvailable) {
+    const overridden = close(finalEff.effPerpTaker, stdNow, eps) && !close(finalEff.effPerpTaker, overlayBestOf, eps);
+    checks.push(C('regression guard: active cheaper overlay is NOT overridden by base VIP (effective == overlay best-of, not standard)', !overridden,
+      overridden
+        ? { verdict: 'BASE-VIP OVERRIDE — discount wiped by standard VIP rate (regression of fee_engine overlay suppression)', standard: stdNow, overlayBestOf, settledEffective: finalEff.effPerpTaker, campaignVol: Math.round(ctx.campaignVol) }
+        : { verdict: 'discount applied', overlayBestOf, settledEffective: finalEff.effPerpTaker, standard: stdNow }));
+  } else {
+    const why = !finalEff?.overlayActive
+      ? `overlay not active yet (campaign volume $${Math.round(ctx.campaignVol).toLocaleString()} not ingested / warm-up) — base VIP is correct here, NOT an override (this is the benign delay path)`
+      : `overlay active but its best-of (${pct(overlayBestOf)}) is not cheaper than standard (${pct(stdNow)}) — nothing for base VIP to override`;
+    checks.push(C('regression guard: active cheaper overlay is NOT overridden by base VIP (effective == overlay best-of, not standard)', true, why, true));
+  }
+
+  // (r2) CHARGED-FEE CONFIRMATION of the same guard, gated on the engine having caught up so a slow
+  //      INGESTION delay (engine never reached the deepened rate within --watch-secs) is reported as
+  //      info, while a discount that was available + had time to apply but was charged at base VIP fails.
+  if (discountAvailable && engineCaughtUp) {
+    const realized = bestCharged != null && close(bestCharged, overlayBestOf, eps);
+    const stuckAtBase = bestCharged != null && close(bestCharged, stdNow, eps) && !realized;
+    checks.push(C('regression guard (charged): a real subject fill was charged the overlay discount, not base VIP', realized && !stuckAtBase,
+      { bestChargedSubjectTaker: bestCharged, overlayBestOf, standard: stdNow, verdict: stuckAtBase ? 'BASE-VIP OVERRIDE on charged fee' : (realized ? 'discount charged' : 'neither — see band checks') }));
+  } else if (discountAvailable) {
+    checks.push(C('regression guard (charged): a real subject fill was charged the overlay discount, not base VIP', true,
+      `DELAY (not a regression): engine did not reach the deepened rate within ${opts.watchSecs}s — overlay poll/ingestion lag, the discount was simply not applied yet`, true));
+  } else {
+    checks.push(C('regression guard (charged): a real subject fill was charged the overlay discount, not base VIP', true, 'no cheaper overlay available to charge (see r1 for classification)', true));
   }
 
   // (e) overlay tier rate matches the qualified competition tier at the final campaign volume.

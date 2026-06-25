@@ -61,7 +61,10 @@ const DEFAULTS = {
   // --- Phase 5: YELLOW tier DECREASE (sell all YELLOW to the maker, confirm fee rises back) ---
   yellowDecrease: true,             // after the YELLOW increase, drain YELLOW and verify the tier drops
   yellowMarket: 'YELLOWUSDT',       // spot market used to sell YELLOW from subject -> maker
-  yellowSellPrice: '0.01',          // limit price for the maker's YELLOW bid (drain price; value irrelevant)
+  yellowSellPrice: '0.01',          // limit price for both the maker's YELLOW bid and the subject's crossing sell
+
+  // --- Phase 6: base-VIP vs overlay crossover (best-of from the "standard is better" side) ---
+  baseVip: true,                    // verify a better base VIP is kept until the overlay beats it (uat only; auto-skips on stage)
 
   rps: 6,
   maxRetries: 5,
@@ -80,6 +83,7 @@ Phases (sequential, share one funded context):
   3 YELLOW up            faucet YELLOW so the 24h avg crosses a tier req; verify the overlay deepens
   4 spot sanity          spot_perp comp -> overlay discounts spot; perp-only -> spot stays standard
   5 YELLOW down          drain YELLOW; verify the tier drops back and the fee rises again
+  6 base-VIP crossover   a better base VIP is KEPT until campaign volume makes the overlay cheaper (uat only)
   + non-enrolled         the counterparty never enrolled -> standard fees only (negative control)
 
 Environments (--env, default uat):
@@ -96,7 +100,7 @@ Usage:
   node run.js --help
 
 Common flags: --env --competition --market --target-tier --target-volume --order-notional
-  --marker-fills --watch-secs --no-yellow --no-spot-check --no-yellow-decrease --epsilon --rps
+  --marker-fills --watch-secs --no-yellow --no-spot-check --no-yellow-decrease --no-base-vip --epsilon --rps
 Output: ./results/fee-verify-<competition>-<ts>.json`;
 
 function parseArgs(argv) {
@@ -147,6 +151,8 @@ function parseArgs(argv) {
       case '--no-yellow-decrease': out.yellowDecrease = false; break;
       case '--yellow-market':   out.yellowMarket = next; i++; break;
       case '--yellow-sell-price': out.yellowSellPrice = next; i++; break;
+      case '--base-vip':        out.baseVip = next !== 'false'; i++; break;
+      case '--no-base-vip':     out.baseVip = false; break;
       case '--rps':             out.rps = parseFloat(next); i++; break;
       case '--delay':           out.delay = parseInt(next, 10); i++; break;
       case '--epsilon':         out.feeEpsilon = parseFloat(next); i++; break;
