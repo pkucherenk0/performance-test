@@ -9,6 +9,7 @@ const { parseArgs } = require('./config');
 const { createRateLimiter } = require('./lib/http');
 const { setup } = require('./setup');
 const { report, writeResults } = require('./lib/report');
+const { setVerbose } = require('./lib/checks');
 
 const { phaseVolume } = require('./cases/phase1-volume-swap');
 const { phaseMarkerFills } = require('./cases/phase2-marker-deepened');
@@ -20,11 +21,12 @@ const { phaseBaseVipCrossover } = require('./cases/phase6-base-vip-crossover');
 
 async function main() {
   const opts = parseArgs(process.argv);
+  setVerbose(opts.debug);   // clean test-report output by default; --debug for the full per-fill firehose
   const rl = createRateLimiter(opts.rps);
   const ctx = await setup(rl, opts);
 
   const checks = [];
-  await phaseVolume(ctx);                                              // phase 1 (no checks; sets up state)
+  checks.push(...await phaseVolume(ctx));                              // phase 1: drives volume + pre-swap taker-discount gate
   checks.push(...await phaseMarkerFills(ctx));                         // phase 2 + all perp-volume assertions
   if (opts.yellow)                        checks.push(...await phaseYellowUp(ctx));
   if (opts.spotCheck)                     checks.push(...await phaseSpotSanity(ctx));

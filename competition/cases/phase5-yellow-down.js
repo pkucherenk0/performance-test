@@ -7,7 +7,7 @@ const { sleep } = require('../lib/http');
 const { getFeeTierEffective } = require('../lib/fees');
 const { getSpotAssetBalance, createSpotOrder } = require('../lib/spot');
 const { expectedCompTier, expectedTierEither, close } = require('../lib/tiers');
-const { C } = require('../lib/checks');
+const { C, logTrade, sid, dbg } = require('../lib/checks');
 const { takerFill } = require('../lib/trade');
 
 async function phaseYellowDown(ctx) {
@@ -35,7 +35,7 @@ async function phaseYellowDown(ctx) {
   const sj = mk.ok ? await createSpotOrder(rl, opts, subject.jwt, subject.appSessionId, { market: opts.yellowMarket, side: 'sell', type: 'limit', amount: String(sellQty), price: opts.yellowSellPrice, tif: 'gtc' }) : { ok: false, error: 'maker bid rejected: ' + mk.error };
   await sleep(1500);
   const yAfterBal = await getSpotAssetBalance(rl, opts, subject.jwt, subject.appSessionId, opts.yellowAsset);
-  console.log(`  sell ${sellQty}: ${sj.ok ? 'ok' : 'FAILED ' + sj.error} | subject ${opts.yellowAsset} now ${yAfterBal}`);
+  console.log(`  sell ${sellQty}: ${sj.ok ? 'ok' : 'FAILED ' + sj.error} | subject ${opts.yellowAsset} now ${yAfterBal} | trade ${sid(sj.orderUuid)} (maker bid ${sid(mk.orderUuid)})`);
 
   console.log(`  waiting up to ${opts.yellowWatchSecs}s for overlay.campaign_yellow_balance to decay below ${yellowResult.req}...`);
   const dDeadline = Date.now() + opts.yellowWatchSecs * 1000;
@@ -43,11 +43,12 @@ async function phaseYellowDown(ctx) {
   while (Date.now() < dDeadline) {
     dEff = await getFeeTierEffective(rl, opts, subject.jwt);
     if (!dEff?.overlayActive || (dEff.overlayCampaignYellow ?? 0) < yellowResult.req) break;
-    console.log(`    campaign_yellow_balance = ${dEff?.overlayCampaignYellow ?? 'n/a'} (want < ${yellowResult.req}); overlay taker ${dEff?.overlayPerpTaker != null ? (dEff.overlayPerpTaker * 100).toFixed(4) + '%' : '-'}`);
+    dbg(`    campaign_yellow_balance = ${dEff?.overlayCampaignYellow ?? 'n/a'} (want < ${yellowResult.req}); overlay taker ${dEff?.overlayPerpTaker != null ? (dEff.overlayPerpTaker * 100).toFixed(4) + '%' : '-'}`);
     await sleep(opts.yellowPollSecs * 1000);
   }
   const yAfter = dEff?.overlayCampaignYellow ?? 0;
   const o = await takerFill(ctx, true, 5);
+  if (!o.skip) logTrade(ctx.fillLog, o.row, opts.feeEpsilon);   // trade id + tag for the post-drain fill
   if (!o.skip && opts.delay) await sleep(opts.delay);
   if (!o.skip) await takerFill(ctx, false, 5);
   const eff3 = await getFeeTierEffective(rl, opts, subject.jwt);

@@ -78,6 +78,8 @@ async function setup(rl, opts) {
   return {
     rl, opts, comp, startTotalVolume, tiers, scheduleSource, tgt, subject, maker, mkt, price, baseline, reductionExpected,
     timeline: [], crossingObs: [], tradedVol: 0, cycle: 0,
+    fillLog: { n: 0, lastRole: null, lastRate: null, phase: null },   // shared per-fill trade logger state (lib/checks.logTrade)
+    warnings: [],                                                     // skips / anomalies / lag notes (lib/checks.recordWarn)
     finalEff: null, campaignVol: 0, finalFloor: null, endTotalVolume: startTotalVolume,
     yellowResult: null, spotResult: null, yellowDecreaseResult: null, nonEnrolledResult: null,
   };

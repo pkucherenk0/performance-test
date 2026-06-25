@@ -7,7 +7,7 @@ const { sleep } = require('../lib/http');
 const { faucet } = require('../lib/accounts');
 const { getFeeTierEffective } = require('../lib/fees');
 const { expectedCompTier, expectedTierEither, close } = require('../lib/tiers');
-const { C } = require('../lib/checks');
+const { C, logTrade, dbg } = require('../lib/checks');
 const { takerFill } = require('../lib/trade');
 
 async function phaseYellowUp(ctx) {
@@ -38,12 +38,13 @@ async function phaseYellowUp(ctx) {
   while (Date.now() < yDeadline) {
     yEff = await getFeeTierEffective(rl, opts, subject.jwt);
     if (yEff?.overlayActive && (yEff.overlayCampaignYellow ?? 0) >= req) break;
-    console.log(`    campaign_yellow_balance = ${yEff?.overlayCampaignYellow ?? 'n/a'} / ${req}; overlay taker ${yEff?.overlayPerpTaker != null ? (yEff.overlayPerpTaker * 100).toFixed(4) + '%' : '-'}`);
+    dbg(`    campaign_yellow_balance = ${yEff?.overlayCampaignYellow ?? 'n/a'} / ${req}; overlay taker ${yEff?.overlayPerpTaker != null ? (yEff.overlayPerpTaker * 100).toFixed(4) + '%' : '-'}`);
     await sleep(opts.yellowPollSecs * 1000);
   }
   const yb = yEff?.overlayCampaignYellow ?? 0;
   const yellowQualified = !!yEff?.overlayActive && yb >= req * (1 - opts.feeEpsilon);
   const o = await takerFill(ctx, true, 3);
+  if (!o.skip) logTrade(ctx.fillLog, o.row, opts.feeEpsilon);   // trade id + tag for the YELLOW-deepened fill
   if (!o.skip && opts.delay) await sleep(opts.delay);
   if (!o.skip) await takerFill(ctx, false, 3);
   const eff2 = await getFeeTierEffective(rl, opts, subject.jwt);
